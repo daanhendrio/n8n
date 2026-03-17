@@ -1,0 +1,227 @@
+name: "Fork: Build and Push Docker Image"
+
+on:
+  workflow_dispatch:
+    inputs:
+      n8n_version:
+        description: "Override n8n tag (default: PINNED_TAG from fork.conf)"
+        required: false
+        type: string
+      build_runners:
+        description: "Build runners image"
+        required: true
+        default: true
+        type: boolean
+      push_image:
+        description: "Push images to GHCR (false = dry run)"
+        required: true
+        default: false
+        type: boolean
+
+env:
+  NODE_VERSION: "24.13.1"
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # ── Get fork.conf from fork/ci ─────────────────────────────────────
+      - name: Checkout fork/ci
+        uses: actions/checkout@v4
+        with:
+          ref: fork/ci
+          path: _ci
+
+      - name: Parse fork.conf
+        id: conf
+        run: |
+          source _ci/fork.conf
+
+          # Allow workflow_dispatch input to override the pinned tag
+          TAG="${{ inputs.n8n_version }}"
+          TAG="${TAG:-$PINNED_TAG}"
+
+          # Ensure tag has n8n@ prefix
+          if [[ ! "$TAG" =~ ^n8n@ ]]; then
+            TAG="n8n@$TAG"
+          fi
+
+          # Image tag: strip "n8n@" prefix, append "-custom"
+          IMAGE_TAG="${TAG#n8n@}-custom"
+
+          echo "tag=$TAG"                >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG"    >> "$GITHUB_OUTPUT"
+          echo "branches=${FEATURE_BRANCHES[*]}" >> "$GITHUB_OUTPUT"
+          echo "n8n_image=${{ env.REGISTRY }}/${{ github.repository_owner }}/n8n"         >> "$GITHUB_OUTPUT"
+          echo "runners_image=${{ env.REGISTRY }}/${{ github.repository_owner }}/n8n-runners" >> "$GITHUB_OUTPUT"
+
+      # ── Checkout upstream tag & apply features ─────────────────────────
+      - name: Checkout upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: n8n-io/n8n
+          ref: ${{ steps.conf.outputs.tag }}
+          fetch-depth: 0
+          path: n8n
+
+      - name: Cherry-pick feature branch commits
+        working-directory: n8n
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Add fork as remote and fetch feature branches
+          git remote add fork https://github.com/${{ github.repository }}.git
+          git fetch fork
+
+          BRANCHES="${{ steps.conf.outputs.branches }}"
+          echo "### Cherry-pick plan" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Branch | Commits | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|---------|--------|" >> "$GITHUB_STEP_SUMMARY"
+
+          for branch in $BRANCHES; do
+            # Get only the custom commits: those on the feature branch
+            # but NOT on the tag (i.e. skip upstream history).
+            COMMITS=$(git rev-list --reverse ${{ steps.conf.outputs.tag }}..fork/$branch)
+            COUNT=$(echo "$COMMITS" | grep -c . || true)
+
+            if [ -z "$COMMITS" ]; then
+              echo "::warning::No custom commits found on $branch"
+              echo "| \`$branch\` | 0 | Skipped |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            echo "Cherry-picking $COUNT commit(s) from $branch ..."
+            # shellcheck disable=SC2086
+            if git cherry-pick --no-rerere-autoupdate $COMMITS; then
+              echo "| \`$branch\` | $COUNT | Applied |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              git cherry-pick --abort 2>/dev/null || true
+              echo "| \`$branch\` | $COUNT | **FAILED** |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::Cherry-pick failed for $branch"
+              exit 1
+            fi
+          done
+
+          echo ""
+          echo "Final commit log (tag..HEAD):"
+          git log --oneline "${{ steps.conf.outputs.tag }}"..HEAD
+
+      - name: Generate merge artifact
+        working-directory: n8n
+        run: |
+          mkdir -p /tmp/fork-merge
+          git log --oneline "${{ steps.conf.outputs.tag }}"..HEAD > /tmp/fork-merge/commits.txt
+          git log --stat "${{ steps.conf.outputs.tag }}"..HEAD   > /tmp/fork-merge/commits-detail.txt
+          git diff "${{ steps.conf.outputs.tag }}"..HEAD         > /tmp/fork-merge/full.patch
+
+      - name: Upload merge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-merge-${{ steps.conf.outputs.image_tag }}
+          path: /tmp/fork-merge/
+          retention-days: 14
+
+      # ── Build n8n ──────────────────────────────────────────────────────
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: n8n/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: n8n/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: n8n
+        run: pnpm install --frozen-lockfile
+
+      - name: Build n8n
+        working-directory: n8n
+        env:
+          CI: "true"
+          N8N_SKIP_LICENSES: "true"
+        run: node scripts/build-n8n.mjs
+
+      # ── Docker setup ───────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: inputs.push_image
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Build & push n8n image ─────────────────────────────────────────
+      - name: Build n8n Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: n8n
+          file: n8n/docker/images/n8n/Dockerfile
+          push: ${{ inputs.push_image }}
+          tags: ${{ steps.conf.outputs.n8n_image }}:${{ steps.conf.outputs.image_tag }}
+          platforms: linux/amd64
+          build-args: |
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            N8N_VERSION=${{ steps.conf.outputs.image_tag }}
+            N8N_RELEASE_TYPE=custom
+          cache-from: type=gha,scope=n8n-image
+          cache-to: type=gha,mode=max,scope=n8n-image
+
+      # ── Build & push runners image ────────────────────────────────────
+      - name: Build runners Docker image
+        if: inputs.build_runners
+        uses: docker/build-push-action@v6
+        with:
+          context: n8n
+          file: n8n/docker/images/runners/Dockerfile
+          push: ${{ inputs.push_image }}
+          tags: ${{ steps.conf.outputs.runners_image }}:${{ steps.conf.outputs.image_tag }}
+          platforms: linux/amd64
+          build-args: |
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            N8N_VERSION=${{ steps.conf.outputs.image_tag }}
+            N8N_RELEASE_TYPE=custom
+          cache-from: type=gha,scope=runners-image
+          cache-to: type=gha,mode=max,scope=runners-image
+
+      # ── Summary ────────────────────────────────────────────────────────
+      - name: Print summary
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Build Configuration" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Setting | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tag | \`${{ steps.conf.outputs.tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image tag | \`${{ steps.conf.outputs.image_tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Feature branches | \`${{ steps.conf.outputs.branches }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Build runners | \`${{ inputs.build_runners }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Push image | \`${{ inputs.push_image }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Results" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.push_image }}" = "true" ]; then
+            echo "| Image | Tag |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|-------|-----|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| \`${{ steps.conf.outputs.n8n_image }}\` | \`${{ steps.conf.outputs.image_tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${{ inputs.build_runners }}" = "true" ]; then
+              echo "| \`${{ steps.conf.outputs.runners_image }}\` | \`${{ steps.conf.outputs.image_tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Pull with:" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`\`\`bash" >> "$GITHUB_STEP_SUMMARY"
+            echo "docker pull ${{ steps.conf.outputs.n8n_image }}:${{ steps.conf.outputs.image_tag }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Dry run completed successfully. No images were pushed." >> "$GITHUB_STEP_SUMMARY"
+          fi
